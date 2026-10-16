@@ -153,16 +153,18 @@ def test_api_generate_caption_endpoint(client: TestClient):
 
 
 def test_api_repliz_config_endpoint(client: TestClient):
-    resp = client.get("/api/v1/publish/repliz/config")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "configured" in data
-    assert "access_key_masked" in data
+    mock_cfg = ReplizConfig(access_key="test_acc", secret_key="test_sec", configured=True, source="env")
+    with patch("backend.services.repliz_publisher.load_config", return_value=mock_cfg):
+        resp = client.get("/api/v1/publish/repliz/config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["configured"] is True
+        assert "access_key_masked" in data
 
 
 def test_api_repliz_accounts_endpoint(client: TestClient):
-    mock_cfg = ReplizConfig(access_key="acc", secret_key="sec", configured=True, source="env")
-    with patch("backend.api.v1.publish.get_repliz_config", return_value=mock_cfg):
+    mock_cfg = ReplizConfig(access_key="test_acc", secret_key="test_sec", configured=True, source="env")
+    with patch("backend.services.repliz_publisher.load_config", return_value=mock_cfg):
         with patch.object(
             ReplizClient,
             "list_accounts",
