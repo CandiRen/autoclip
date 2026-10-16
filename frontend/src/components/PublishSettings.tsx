@@ -8,6 +8,7 @@ import { publishGuideHref } from '../publish/guide'
 import { platformLabel, readApiDetail } from '../publish/uploadPost'
 import { bilibiliApi } from '../publish/bilibiliApi'
 import { uploadPostApi, type UploadPostConfigView, type UploadPostProfile } from '../publish/uploadPostApi'
+import { replizApi, type ReplizAccount, type ReplizConfigView } from '../publish/replizApi'
 
 const openPublishGuide = () => openExternalLink(publishGuideHref(i18n.language))
 
@@ -16,6 +17,10 @@ const USERS_URL = 'https://app.upload-post.com/manage-users'
 
 const emptyConfig = (): UploadPostConfigView => ({
   configured: false, source: 'none', api_key_masked: '', user: '',
+})
+
+const emptyReplizConfig = (): ReplizConfigView => ({
+  configured: false, source: 'none', access_key_masked: '', secret_key_masked: '', default_account_id: null,
 })
 
 const PublishSettings: React.FC = () => {
@@ -33,6 +38,16 @@ const PublishSettings: React.FC = () => {
   const [cookie, setCookie] = useState('')
   const [savingBili, setSavingBili] = useState(false)
   const [clearingBili, setClearingBili] = useState(false)
+
+  // Repliz state
+  const [replizConfig, setReplizConfig] = useState<ReplizConfigView>(emptyReplizConfig)
+  const [replizAccounts, setReplizAccounts] = useState<ReplizAccount[]>([])
+  const [replizAccessKey, setReplizAccessKey] = useState('')
+  const [replizSecretKey, setReplizSecretKey] = useState('')
+  const [replizDefaultAcc, setReplizDefaultAcc] = useState('')
+  const [savingRepliz, setSavingRepliz] = useState(false)
+  const [clearingRepliz, setClearingRepliz] = useState(false)
+
   const [error, setError] = useState<string | null>(null)
 
   const loadProfiles = useCallback(async (preferred: string) => {
@@ -44,11 +59,24 @@ const PublishSettings: React.FC = () => {
     return list
   }, [])
 
+  const loadReplizAccounts = useCallback(async () => {
+    try {
+      const res = await replizApi.getAccounts()
+      setReplizAccounts(res.accounts || [])
+    } catch {
+      setReplizAccounts([])
+    }
+  }, [])
+
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const [cfg, bili] = await Promise.all([uploadPostApi.getConfig(), bilibiliApi.getConfig()])
+      const [cfg, bili, rep] = await Promise.all([
+        uploadPostApi.getConfig(),
+        bilibiliApi.getConfig(),
+        replizApi.getConfig().catch(() => emptyReplizConfig()),
+      ])
       setConfig(cfg)
       setUser(cfg.user || '')
       setBiliConfigured(bili.configured)
@@ -56,12 +84,20 @@ const PublishSettings: React.FC = () => {
       setBiliSource(bili.source || 'none')
       if (cfg.configured) await loadProfiles(cfg.user || '')
       else setProfiles([])
+
+      setReplizConfig(rep)
+      setReplizDefaultAcc(rep.default_account_id || '')
+      if (rep.configured) {
+        await loadReplizAccounts()
+      } else {
+        setReplizAccounts([])
+      }
     } catch (err) {
       setError(readApiDetail(err, t("发布失败")))
     } finally {
       setLoading(false)
     }
-  }, [loadProfiles])
+  }, [loadProfiles, loadReplizAccounts])
 
   useEffect(() => { void load() }, [load])
 
@@ -150,6 +186,54 @@ const PublishSettings: React.FC = () => {
       setError(readApiDetail(err, t("发布失败")))
     } finally {
       setClearingBili(false)
+    }
+  }
+
+  const saveRepliz = async () => {
+    const acc = replizAccessKey.trim()
+    const sec = replizSecretKey.trim()
+    const defAcc = replizDefaultAcc.trim()
+    if (!acc && !sec && !defAcc) {
+      setError(t("请填写 Repliz 的 Access Key 和 Secret Key。"))
+      return
+    }
+    setSavingRepliz(true)
+    setError(null)
+    try {
+      const saved = await replizApi.saveConfig({
+        ...(acc ? { access_key: acc } : {}),
+        ...(sec ? { secret_key: sec } : {}),
+        ...(defAcc ? { default_account_id: defAcc } : {}),
+      })
+      setReplizAccessKey('')
+      setReplizSecretKey('')
+      setReplizConfig(saved)
+      if (saved.configured) {
+        await loadReplizAccounts()
+      }
+      message.success(t("Repliz 配置已保存并验证成功。"))
+    } catch (err) {
+      setError(readApiDetail(err, t("保存 Repliz 配置失败。")))
+    } finally {
+      setSavingRepliz(false)
+    }
+  }
+
+  const clearRepliz = async () => {
+    setClearingRepliz(true)
+    setError(null)
+    try {
+      await replizApi.clearConfig()
+      setReplizAccessKey('')
+      setReplizSecretKey('')
+      setReplizAccounts([])
+      setReplizConfig(emptyReplizConfig())
+      message.success(t("Repliz 配置已清除。"))
+      await load()
+    } catch (err) {
+      setError(readApiDetail(err, t("清除 Repliz 配置失败。")))
+    } finally {
+      setClearingRepliz(false)
     }
   }
 
@@ -265,6 +349,105 @@ const PublishSettings: React.FC = () => {
             <Btn size="sm" variant="cta" loading={saving} onClick={() => void save()}>{t("保存并校验")}</Btn>
             {config.source === 'file' && (
               <Btn size="sm" variant="danger" loading={clearing} onClick={() => void clear()}>{t("清除本机保存的密钥")}</Btn>
+            )}
+          </Row>
+        </div>
+      </Section>
+      <Section
+        title={t("Repliz (Threads / Instagram / TikTok / Facebook)")}
+        description={t("连接 repliz.com API 实现多平台自动发布与定时排期。")}
+        right={
+          <Btn size="sm" onClick={() => void openExternalLink("https://repliz.com")}>
+            Repliz<Icon.External size={12} />
+          </Btn>
+        }
+      >
+        <div className="ac-rows">
+          <Row
+            wide
+            label={t("Repliz Access Key")}
+            hint={t("在 Repliz 控制台生成，只保存在这台机器上。")}
+          >
+            <input
+              className="ac-input ac-input--mono"
+              type="text"
+              name="repliz-access-key"
+              autoComplete="off"
+              spellCheck={false}
+              aria-label={t("Repliz Access Key")}
+              placeholder={replizConfig.access_key_masked || 'REPLIZ_ACCESS_KEY'}
+              value={replizAccessKey}
+              onChange={(e) => setReplizAccessKey(e.target.value)}
+            />
+          </Row>
+          <Row
+            wide
+            label={t("Repliz Secret Key")}
+            hint={t("与 Access Key 配对的私钥。")}
+          >
+            <input
+              className="ac-input ac-input--mono"
+              type="password"
+              name="repliz-secret-key"
+              autoComplete="new-password"
+              spellCheck={false}
+              aria-label={t("Repliz Secret Key")}
+              placeholder={replizConfig.secret_key_masked || 'REPLIZ_SECRET_KEY'}
+              value={replizSecretKey}
+              onChange={(e) => setReplizSecretKey(e.target.value)}
+            />
+          </Row>
+          <Row
+            label={t("状态")}
+            hint={
+              replizConfig.source === 'env'
+                ? t("从环境变量 REPLIZ_ACCESS_KEY 读取配置。")
+                : replizConfig.source === 'post_env'
+                  ? t("配置从 /home/cr/project/post/.env 自动读取")
+                  : undefined
+            }
+          >
+            {loading ? (
+              <StatusDot tone="muted" label={t("还在处理中")} />
+            ) : replizConfig.configured ? (
+              <StatusDot
+                tone="ok"
+                label={t("已连接（{{count}} 个账号）", { count: replizAccounts.length })}
+              />
+            ) : (
+              <StatusDot tone="muted" label={t("未配置")} />
+            )}
+          </Row>
+          {replizAccounts.length > 0 && (
+            <Row
+              stack
+              label={t("已连接账号")}
+              hint={t("选择 Repliz 发布的默认账号。")}
+            >
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                <Segmented
+                  className="ac-segmented"
+                  size="sm"
+                  ariaLabel={t("已连接账号")}
+                  value={replizDefaultAcc}
+                  onChange={setReplizDefaultAcc}
+                  options={replizAccounts.map((a) => ({
+                    value: a._id || a.id || '',
+                    label: `${a.name || a.username} (${a.type})`,
+                  }))}
+                />
+                <Btn size="sm" onClick={() => void loadReplizAccounts()}>{t("刷新账号")}</Btn>
+              </div>
+            </Row>
+          )}
+          <Row label={t("保存")}>
+            <Btn size="sm" variant="cta" loading={savingRepliz} onClick={() => void saveRepliz()}>
+              {t("保存并校验")}
+            </Btn>
+            {replizConfig.source === 'file' && (
+              <Btn size="sm" variant="danger" loading={clearingRepliz} onClick={() => void clearRepliz()}>
+                {t("清除本机保存的账号")}
+              </Btn>
             )}
           </Row>
         </div>

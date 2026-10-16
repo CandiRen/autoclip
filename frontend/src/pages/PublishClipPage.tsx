@@ -17,10 +17,12 @@ import {
   type PublishVisibility,
 } from '../publish/uploadPost'
 import { uploadPostApi, type PlatformResult, type PublishJobView, type UploadPostProfile } from '../publish/uploadPostApi'
+import { captionApi, type CaptionGenerationResult } from '../publish/captionApi'
+import { replizApi, type ReplizAccount } from '../publish/replizApi'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-type Track = { kind: 'upload-post' | 'bilibili'; jobId: string }
+type Track = { kind: 'upload-post' | 'bilibili' | 'repliz'; jobId: string }
 
 function coverPlatform(platforms: string[]): 'bilibili' | 'douyin' {
   if (platforms.includes('bilibili') && platforms.every((p) => p === 'bilibili')) return 'bilibili'
@@ -81,8 +83,22 @@ const PublishClipPage: React.FC = () => {
 
   const [clipTitle, setClipTitle] = useState('')
   const [loading, setLoading] = useState(true)
+  const [gateway, setGateway] = useState<'upload-post' | 'repliz'>('upload-post')
   const [configured, setConfigured] = useState(false)
   const [biliConfigured, setBiliConfigured] = useState(false)
+  const [replizConfigured, setReplizConfigured] = useState(false)
+  const [replizAccounts, setReplizAccounts] = useState<ReplizAccount[]>([])
+  const [selectedReplizAcc, setSelectedReplizAcc] = useState('')
+  const [replizPostType, setReplizPostType] = useState('video')
+  const [replizTopic, setReplizTopic] = useState('')
+  const [replizReplyText, setReplizReplyText] = useState('')
+
+  // AI Caption states
+  const [captionLoading, setCaptionLoading] = useState(false)
+  const [captionResult, setCaptionResult] = useState<CaptionGenerationResult | null>(null)
+  const [selectedVariationIdx, setSelectedVariationIdx] = useState(0)
+  const [showCaptionPanel, setShowCaptionPanel] = useState(false)
+
   const [profiles, setProfiles] = useState<UploadPostProfile[]>([])
   const [user, setUser] = useState('')
   const [selected, setSelected] = useState<string[]>([])
@@ -112,10 +128,11 @@ const PublishClipPage: React.FC = () => {
     const load = async () => {
       setLoading(true)
       try {
-        const [project, cfg, bili] = await Promise.all([
+        const [project, cfg, bili, rep] = await Promise.all([
           projectApi.getProject(projectId),
           uploadPostApi.getConfig(),
           bilibiliApi.getConfig(),
+          replizApi.getConfig().catch(() => ({ configured: false, default_account_id: null })),
         ])
         if (cancelled || runId.current !== session) return
         let clips = project.clips || []
@@ -162,6 +179,19 @@ const PublishClipPage: React.FC = () => {
           list = res.profiles || []
           next = list.some((p) => p.username === cfg.user) ? cfg.user : (list[0]?.username || cfg.user || '')
         }
+        if (rep.configured) {
+          setReplizConfigured(true)
+          try {
+            const accsRes = await replizApi.getAccounts()
+            const accs = accsRes.accounts || []
+            setReplizAccounts(accs)
+            const defId = rep.default_account_id || accs[0]?._id || accs[0]?.id || ''
+            setSelectedReplizAcc(defId)
+            if (!cfg.configured && !bili.configured) {
+              setGateway('repliz')
+            }
+          } catch { /* ignore */ }
+        }
         setProfiles(list)
         setUser(next)
         const connected = list.find((p) => p.username === next)?.connected_platforms || []
@@ -175,6 +205,39 @@ const PublishClipPage: React.FC = () => {
     void load()
     return () => { cancelled = true }
   }, [projectId, clipId, studioJobId])
+
+  const handleGenerateCaption = async () => {
+    setCaptionLoading(true)
+    setError(null)
+    try {
+      const activePlatform = gateway === 'repliz' ? 'threads' : (selected[0] || 'threads')
+      const res = await captionApi.generate({
+        project_id: projectId,
+        clip_id: clipId,
+        title: title || clipTitle,
+        platform: activePlatform,
+        language: i18n.language,
+      })
+      if (res.ok) {
+        setCaptionResult(res)
+        setShowCaptionPanel(true)
+        setSelectedVariationIdx(0)
+        if (res.variations[0]?.caption) {
+          setDescription(res.variations[0].caption)
+        }
+        if (!title && res.topic) {
+          setTitle(res.topic)
+        }
+        if (res.topic && !replizTopic) {
+          setReplizTopic(res.topic)
+        }
+      }
+    } catch (err) {
+      setError(readApiDetail(err, t("AI 生成文案失败")))
+    } finally {
+      setCaptionLoading(false)
+    }
+  }
 
   const chooseUser = (next: string) => {
     setUser(next)
@@ -239,12 +302,50 @@ const PublishClipPage: React.FC = () => {
   const connected = profile?.connected_platforms || []
   const destinations = publishDestinations(connected, biliConfigured)
   const reconnect = (profile?.reconnect_platforms || []).map(platformLabel).join(' · ')
-  const ready = configured || biliConfigured
+  const ready = configured || biliConfigured || replizConfigured
   const busy = phase === 'running' || phase === 'waiting' || savingFile
   const preset = renderPreset(selected)
   const longYoutube = selected.includes('youtube') && title.trim().length > 100
 
   const publish = async () => {
+    if (gateway === 'repliz') {
+      if (!selectedReplizAcc) {
+        setError(t("选择目标 Repliz 账号。"))
+        return
+      }
+      const schedule = buildSchedule(when, whenValue, Intl.DateTimeFormat().resolvedOptions().timeZone, Date.now())
+      if (!schedule.ok) {
+        setError(schedule.reason === 'empty' ? t("选择发出的时间") : t("时间要晚于现在"))
+        return
+      }
+      const session = runId.current
+      setError(null)
+      setResults([])
+      setPhase('running')
+      setPercent(20)
+      const tracks: Track[] = []
+      try {
+        const started = await replizApi.start(projectId, clipId, {
+          account_id: selectedReplizAcc,
+          post_type: replizPostType,
+          title: title.trim() || undefined,
+          description: description.trim() || undefined,
+          topic: replizTopic.trim() || undefined,
+          scheduled_date: when === 'later' ? schedule.scheduled_date : undefined,
+          reply_text: replizReplyText.trim() || undefined,
+          subtitles,
+          title_card: titleCard,
+        })
+        tracks.push({ kind: 'repliz', jobId: started.job_id })
+      } catch (err) {
+        setError(readApiDetail(err, t("发布失败")))
+        setPhase('failed')
+        return
+      }
+      await monitorTracks(tracks, session, when === 'later')
+      return
+    }
+
     const overseas = selected.filter((item) => item !== 'bilibili')
     const sendBili = selected.includes('bilibili')
     if (!overseas.length && !sendBili) {
@@ -261,15 +362,11 @@ const PublishClipPage: React.FC = () => {
       return
     }
     const session = runId.current
-    const later = when === 'later'
     setError(null)
     setResults([])
     setPhase('running')
     setPercent(12)
     const tracks: Track[] = []
-    const telemetryGeneration = workflow.generation()
-    const telemetryEnabled = workflow.active(telemetryGeneration)
-    const observed = new Set<string>()
     try {
       if (overseas.length) {
         const started = await uploadPostApi.start(projectId, clipId, {
@@ -308,10 +405,18 @@ const PublishClipPage: React.FC = () => {
       }
       setError(readApiDetail(err, t("发布失败")))
     }
+    await monitorTracks(tracks, session, when === 'later')
+  }
+
+  const monitorTracks = async (tracks: Track[], session: number, later: boolean) => {
     if (runId.current !== session) return
     const deadline = Date.now() + 30 * 60 * 1000
     let waitMs = 2000
     let sawPending = false
+    const telemetryGeneration = workflow.generation()
+    const telemetryEnabled = workflow.active(telemetryGeneration)
+    const observed = new Set<string>()
+
     while (Date.now() < deadline) {
       if (runId.current !== session) return
       await sleep(waitMs)
@@ -322,16 +427,38 @@ const PublishClipPage: React.FC = () => {
       let message = ''
       const merged: PlatformResult[] = []
       for (const track of tracks) {
-        const job = track.kind === 'upload-post'
-          ? await uploadPostApi.job(track.jobId)
-          : await bilibiliApi.job(track.jobId)
+        let settled: ReturnType<typeof settleJob>
+        if (track.kind === 'upload-post') {
+          const job = await uploadPostApi.job(track.jobId)
+          settled = settleJob(job, later)
+        } else if (track.kind === 'bilibili') {
+          const job = await bilibiliApi.job(track.jobId)
+          settled = settleJob(job, later)
+        } else {
+          const job = await replizApi.job(track.jobId)
+          if (job.status === 'failed') {
+            settled = { pending: false, failed: true, scheduled: false, results: [], error: job.error }
+          } else if (job.status === 'queued' || job.status === 'running') {
+            settled = { pending: true, failed: false, scheduled: false, results: [] }
+          } else {
+            settled = {
+              pending: false,
+              failed: false,
+              scheduled: true,
+              results: [{
+                platform: 'repliz',
+                success: true,
+                message: job.schedule_id ? `ID: ${job.schedule_id}` : 'Terkirim ke Repliz',
+              }],
+            }
+          }
+        }
         if (runId.current !== session) return
-        const settled = settleJob(job, later)
         if (!settled.pending && !observed.has(track.jobId)) {
           observed.add(track.jobId)
           if (telemetryEnabled) socialPublishObserved(telemetryGeneration, {
             ...workflow.context(projectId, studioJobId || undefined), source_type: studioJobId ? 'studio' : 'legacy', gateway: track.kind,
-            outcome: socialPublishOutcome(job.status, settled.scheduled, settled.results),
+            outcome: socialPublishOutcome(settled.failed ? 'failed' : 'completed', settled.scheduled, settled.results),
           })
         }
         if (settled.pending) pending = true
@@ -432,12 +559,110 @@ const PublishClipPage: React.FC = () => {
         )}
         {!loading && ready && (
           <>
-            {profiles.length > 1 && (
-              <Row label={t("默认账号")}>
-                <Segmented size="sm" ariaLabel={t("默认账号")} value={user} onChange={chooseUser}
-                  options={profiles.map((p) => ({ value: p.username, label: p.username }))} />
+            {replizConfigured && (configured || biliConfigured) && (
+              <Row label={t("平台")}>
+                <Segmented
+                  size="sm"
+                  ariaLabel={t("平台")}
+                  value={gateway}
+                  onChange={(v) => setGateway(v as 'upload-post' | 'repliz')}
+                  options={[
+                    { value: 'upload-post', label: 'Upload-Post / B站' },
+                    { value: 'repliz', label: 'Repliz.com' },
+                  ]}
+                />
               </Row>
             )}
+
+            {gateway === 'repliz' ? (
+              <>
+                {replizAccounts.length > 0 && (
+                  <Row label={t("Repliz 账号")} stack>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {replizAccounts.map((acc) => {
+                        const accId = acc._id || acc.id || ''
+                        const isPicked = selectedReplizAcc === accId
+                        return (
+                          <button
+                            key={accId}
+                            type="button"
+                            className="ac-btn ac-btn--sm"
+                            style={{
+                              borderColor: isPicked ? 'var(--ac-accent)' : undefined,
+                              background: isPicked ? 'var(--ac-accent-subtle, rgba(0,0,0,0.06))' : undefined,
+                            }}
+                            onClick={() => setSelectedReplizAcc(accId)}
+                          >
+                            {acc.name || acc.username} ({acc.type})
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </Row>
+                )}
+                <Row label={t("发布类型")}>
+                  <Segmented
+                    size="sm"
+                    ariaLabel={t("发布类型")}
+                    value={replizPostType}
+                    onChange={setReplizPostType}
+                    options={[
+                      { value: 'video', label: t("视频 / Reel") },
+                      { value: 'text', label: t("纯文字 / Thread") },
+                      { value: 'image', label: t("图文") },
+                    ]}
+                  />
+                </Row>
+                <Row wide label={t("内容话题")} hint={t("Threads 专属话题分类（例如：日常生活、理财技巧）")}>
+                  <input
+                    className="ac-input"
+                    aria-label={t("内容话题")}
+                    placeholder={t("例如：晨间灵感、职场干货")}
+                    value={replizTopic}
+                    onChange={(e) => setReplizTopic(e.target.value)}
+                  />
+                </Row>
+                <Row wide label={t("自动回复评论")} hint={t("发布后首条跟帖回复（例如：商品链接、总结等）")}>
+                  <textarea
+                    className="ac-input ac-textarea"
+                    style={{ minHeight: 64 }}
+                    aria-label={t("自动回复评论")}
+                    placeholder={t("填写首条自动回复内容...")}
+                    value={replizReplyText}
+                    onChange={(e) => setReplizReplyText(e.target.value)}
+                  />
+                </Row>
+              </>
+            ) : (
+              <>
+                {profiles.length > 1 && (
+                  <Row label={t("默认账号")}>
+                    <Segmented size="sm" ariaLabel={t("默认账号")} value={user} onChange={chooseUser}
+                      options={profiles.map((p) => ({ value: p.username, label: p.username }))} />
+                  </Row>
+                )}
+                {destinations.length > 0 && (
+                  <Row label={t("选择要发布的平台")} stack>
+                    <div className="ac-seg ac-seg--sm" role="group" aria-label={t("选择要发布的平台")}>
+                      {destinations.map((p) => (
+                        <button key={p} type="button" aria-pressed={selected.includes(p)} onClick={() => toggle(p)} disabled={busy}>{platformLabel(p)}</button>
+                      ))}
+                    </div>
+                  </Row>
+                )}
+                {configured && profiles.length > 0 && !connected.length && !biliConfigured && !reconnect && (
+                  <p style={{ color: 'var(--ac-sub)', fontSize: 13 }}>{t("这个账号还没有连接平台。")}</p>
+                )}
+                {reconnect && (
+                  <p style={{ color: 'var(--ac-sub)', fontSize: 13, margin: '8px 0 0' }}>{t("需要重新连接：{{platforms}}", { platforms: reconnect })}</p>
+                )}
+                <Row label={t("可见范围")} hint={t("默认先发到自己看得到的地方。公开会直接出现在账号上。")}>
+                  <Segmented size="sm" ariaLabel={t("可见范围")} value={visibility} onChange={setVisibility}
+                    options={[{ value: 'private', label: t("仅自己") }, { value: 'public', label: t("公开") }]} />
+                </Row>
+              </>
+            )}
+
             <Row label={t("何时")}>
               <Segmented size="sm" ariaLabel={t("何时")} value={when} onChange={setWhen}
                 options={[{ value: 'now', label: t("现在发") }, { value: 'later', label: t("定时") }]} />
@@ -447,30 +672,95 @@ const PublishClipPage: React.FC = () => {
                 <input className="ac-input" style={{ width: 220 }} type="datetime-local" aria-label={t("选择发出的时间")} value={whenValue} onChange={(e) => setWhenValue(e.target.value)} />
               </Row>
             )}
-            {destinations.length > 0 && (
-              <Row label={t("选择要发布的平台")} stack>
-                <div className="ac-seg ac-seg--sm" role="group" aria-label={t("选择要发布的平台")}>
-                  {destinations.map((p) => (
-                    <button key={p} type="button" aria-pressed={selected.includes(p)} onClick={() => toggle(p)} disabled={busy}>{platformLabel(p)}</button>
-                  ))}
-                </div>
-              </Row>
-            )}
-            {configured && profiles.length > 0 && !connected.length && !biliConfigured && !reconnect && (
-              <p style={{ color: 'var(--ac-sub)', fontSize: 13 }}>{t("这个账号还没有连接平台。")}</p>
-            )}
-            {reconnect && (
-              <p style={{ color: 'var(--ac-sub)', fontSize: 13, margin: '8px 0 0' }}>{t("需要重新连接：{{platforms}}", { platforms: reconnect })}</p>
-            )}
-            <Row label={t("可见范围")} hint={t("默认先发到自己看得到的地方。公开会直接出现在账号上。")}>
-              <Segmented size="sm" ariaLabel={t("可见范围")} value={visibility} onChange={setVisibility}
-                options={[{ value: 'private', label: t("仅自己") }, { value: 'public', label: t("公开") }]} />
-            </Row>
+
             <Row wide label={t("标题")} hint={longYoutube ? t("YouTube 标题超过 100 字时会自动缩短。") : t("不填就用切片标题。")}>
               <input className="ac-input" aria-label={t("标题")} value={title} onChange={(e) => setTitle(e.target.value)} />
             </Row>
+
             <Row wide label={t("描述")} hint={t("YouTube、LinkedIn、Facebook、Pinterest 和 B 站会用到。")}>
-              <textarea className="ac-input ac-textarea" style={{ minHeight: 88 }} aria-label={t("描述")} value={description} onChange={(e) => setDescription(e.target.value)} />
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, width: '100%' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                  <Btn size="sm" loading={captionLoading} disabled={busy} onClick={() => void handleGenerateCaption()}>
+                    {captionLoading ? t("正在生成文案...") : t("✨ AI 生成文案与标签")}
+                  </Btn>
+                  {captionResult && (
+                    <Btn size="sm" variant="text" onClick={() => setShowCaptionPanel(!showCaptionPanel)}>
+                      {showCaptionPanel ? t("收起风格选项") : t("选择文案风格（{{count}}）", { count: captionResult.variations.length })}
+                    </Btn>
+                  )}
+                </div>
+
+                {showCaptionPanel && captionResult && (
+                  <div style={{
+                    background: 'var(--ac-card, rgba(0,0,0,0.02))',
+                    border: '1px solid var(--ac-line)',
+                    borderRadius: 10,
+                    padding: 12,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 10,
+                  }}>
+                    {captionResult.topic && (
+                      <div style={{ fontSize: 12.5, color: 'var(--ac-sub)' }}>
+                        <strong>{t("推荐话题：")}</strong> {captionResult.topic}
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {captionResult.variations.map((v, idx) => (
+                        <button
+                          key={v.style}
+                          type="button"
+                          className="ac-btn ac-btn--sm"
+                          style={{
+                            borderColor: selectedVariationIdx === idx ? 'var(--ac-accent)' : undefined,
+                            background: selectedVariationIdx === idx ? 'var(--ac-accent-subtle, rgba(0,0,0,0.06))' : undefined,
+                            fontWeight: selectedVariationIdx === idx ? 600 : 400,
+                          }}
+                          onClick={() => {
+                            setSelectedVariationIdx(idx)
+                            setDescription(v.caption)
+                          }}
+                        >
+                          {v.style_label}
+                        </button>
+                      ))}
+                    </div>
+                    {captionResult.hashtags.length > 0 && (
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                        <span style={{ fontSize: 12, color: 'var(--ac-sub)' }}>{t("点击添加标签：")}</span>
+                        {captionResult.hashtags.map((tag) => (
+                          <span
+                            key={tag}
+                            style={{
+                              background: 'var(--ac-thumb)',
+                              padding: '2px 8px',
+                              borderRadius: 6,
+                              fontSize: 12,
+                              cursor: 'pointer',
+                            }}
+                            onClick={() => {
+                              if (!description.includes(tag)) {
+                                setDescription((prev) => `${prev.trim()} ${tag}`.trim())
+                              }
+                            }}
+                          >
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <textarea
+                  className="ac-input ac-textarea"
+                  style={{ minHeight: 96, width: '100%' }}
+                  aria-label={t("描述")}
+                  placeholder={t("输入发布文案，或点击上方“✨ AI 生成文案与标签”...")}
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                />
+              </div>
             </Row>
             <Row stack label={t("封面")} hint={t("生图失败或未生成时，投稿会自动截帧，不会卡住发布。")}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '100%' }}>

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -23,6 +24,10 @@ from pydantic import BaseModel, Field
 from backend.services import bilibili_publisher as bili
 from backend.services import cover as cover_svc
 from backend.services import upload_post_publisher as up
+from backend.services import repliz_publisher as repliz
+from backend.services.caption_generator import caption_generator
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/publish", tags=["publish"])
 
@@ -375,3 +380,268 @@ async def get_cover_job(job_id: str):
 @router.post("/covers/jobs/{job_id}/cancel")
 async def cancel_cover_job(job_id: str):
     return cover_svc.cancel_job(job_id)
+
+
+# ── AI Caption & Hashtag Generation ──────────────────────────────────────────
+
+class GenerateCaptionBody(BaseModel):
+    project_id: str | None = None
+    clip_id: str | None = None
+    title: str | None = None
+    transcript: str | None = None
+    platform: str = "threads"
+    language: str = "id"
+    style: str = "viral"
+    custom_prompt: str | None = None
+
+
+@router.post("/generate-caption")
+async def generate_caption(body: GenerateCaptionBody):
+    """
+    Generate high-quality, relevant social media captions and hashtags
+    tailored to specific platforms and styles.
+    """
+    text_content = body.transcript or ""
+    clip_title = body.title or ""
+    clip_outline = ""
+
+    # If project_id & clip_id are provided, attempt to enrich context from clip metadata
+    if body.project_id and body.clip_id:
+        try:
+            from backend.services.publish_export import load_clip_meta
+            meta = load_clip_meta(body.project_id, body.clip_id)
+            if not clip_title:
+                clip_title = meta.get("generated_title") or meta.get("title") or ""
+            clip_outline = meta.get("outline") or ""
+            if not text_content:
+                text_content = meta.get("content") or meta.get("transcript") or ""
+        except Exception:
+            pass
+
+    try:
+        res = caption_generator.generate(
+            title=clip_title,
+            transcript=text_content,
+            platform=body.platform,
+            language=body.language,
+            custom_prompt=body.custom_prompt or "",
+            clip_outline=clip_outline,
+        )
+        return {
+            "ok": True,
+            "title": res.title,
+            "topic": res.topic,
+            "hashtags": res.hashtags,
+            "best_caption": res.best_caption,
+            "variations": [
+                {
+                    "style": v.style,
+                    "style_label": v.style_label,
+                    "caption": v.caption,
+                    "hashtags": v.hashtags,
+                }
+                for v in res.variations
+            ],
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Failed to generate caption: %s", e)
+        raise HTTPException(status_code=500, detail=f"Gagal membuat caption AI: {e}")
+
+
+# ── Repliz.com Social Publishing ─────────────────────────────────────────────
+
+def _repliz_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, repliz.ReplizError):
+        code = exc.status_code if exc.status_code in (400, 401, 402, 403, 404, 422, 429, 502) else 400
+        return HTTPException(status_code=code, detail=str(exc))
+    return HTTPException(status_code=500, detail=str(exc))
+
+
+class ReplizConfigBody(BaseModel):
+    access_key: str | None = Field(None, description="Repliz Access Key")
+    secret_key: str | None = Field(None, description="Repliz Secret Key")
+    default_account_id: str | None = Field(None, description="Default Repliz connected Account ID")
+
+
+class ReplizPublishBody(BaseModel):
+    account_id: str = Field(..., description="Repliz target account ID")
+    post_type: str = Field("video", description="text, video, image, reel, album, link")
+    title: str | None = Field(None, description="Post title (e.g. for YouTube/media)")
+    description: str | None = Field(None, description="Main caption text")
+    topic: str | None = Field(None, description="Optional topic category for Threads")
+    scheduled_date: str | None = Field(None, description="ISO-8601 UTC timestamp")
+    media_url: str | None = Field(None, description="Public URL of attached media")
+    reply_text: str | None = Field(None, description="Optional follow-up reply in thread")
+    replies: list[dict[str, Any]] = Field(default_factory=list, description="Follow-up chain replies")
+    subtitles: bool = True
+    title_card: bool = True
+
+
+class ReplizUpdateScheduleBody(BaseModel):
+    description: str | None = None
+    schedule_at: str | None = None
+    topic: str | None = None
+    title: str | None = None
+
+
+@router.get("/repliz/config")
+async def get_repliz_config():
+    cfg = repliz.load_config()
+    return cfg.public()
+
+
+@router.put("/repliz/config")
+async def put_repliz_config(body: ReplizConfigBody):
+    if body.access_key is None and body.secret_key is None and body.default_account_id is None:
+        raise HTTPException(status_code=400, detail="access_key, secret_key, atau default_account_id harus diisi")
+
+    # If updating keys, test connection first
+    cfg = repliz.load_config()
+    test_acc = body.access_key if body.access_key is not None else cfg.access_key
+    test_sec = body.secret_key if body.secret_key is not None else cfg.secret_key
+
+    if test_acc and test_sec:
+        try:
+            verified = repliz.verify_credentials(test_acc, test_sec)
+        except Exception as e:  # noqa: BLE001
+            raise _repliz_error(e)
+    else:
+        verified = None
+
+    saved_cfg = repliz.save_config(
+        access_key=body.access_key,
+        secret_key=body.secret_key,
+        default_account_id=body.default_account_id,
+    )
+
+    note = "Konfigurasi berhasil disimpan."
+    if saved_cfg.source == "env":
+        note = "Tersimpan ke file, namun proses saat ini memprioritaskan variabel lingkungan REPLIZ_ACCESS_KEY."
+    elif saved_cfg.source == "post_env":
+        note = "Kredensial aktif terbaca otomatis dari /home/cr/project/post/.env."
+
+    return {
+        "ok": True,
+        **saved_cfg.public(),
+        "account_info": verified,
+        "note": note,
+    }
+
+
+@router.delete("/repliz/config")
+async def delete_repliz_config():
+    cfg = repliz.clear_config()
+    return {"ok": True, **cfg.public()}
+
+
+@router.get("/repliz/accounts")
+async def get_repliz_accounts():
+    try:
+        client = repliz.ReplizClient()
+        accounts = client.list_accounts()
+        return {"accounts": accounts}
+    except Exception as e:  # noqa: BLE001
+        raise _repliz_error(e)
+
+
+@router.get("/repliz/accounts/{account_id}/stats")
+async def get_repliz_account_stats(account_id: str):
+    try:
+        client = repliz.ReplizClient()
+        return client.get_account_statistics(account_id)
+    except Exception as e:  # noqa: BLE001
+        raise _repliz_error(e)
+
+
+@router.get("/repliz/schedules")
+async def get_repliz_schedules(account_id: str | None = None, page: int = 1, limit: int = 50):
+    try:
+        client = repliz.ReplizClient()
+        return client.list_schedules(account_id=account_id, page=page, limit=limit)
+    except Exception as e:  # noqa: BLE001
+        raise _repliz_error(e)
+
+
+@router.post("/repliz/{project_id}/clips/{clip_id}")
+async def start_repliz_publish(project_id: str, clip_id: str, body: ReplizPublishBody):
+    cfg = repliz.load_config()
+    if not cfg.configured:
+        raise HTTPException(
+            status_code=400,
+            detail="Koneksi Repliz belum dikonfigurasi. Atur access key & secret key di Pengaturan.",
+        )
+    return repliz.start_publish(
+        repliz.ReplizPublishRequest(
+            project_id=project_id,
+            clip_id=clip_id,
+            account_id=body.account_id,
+            post_type=body.post_type,
+            title=body.title,
+            description=body.description,
+            topic=body.topic,
+            scheduled_date=body.scheduled_date,
+            media_url=body.media_url,
+            reply_text=body.reply_text,
+            replies=body.replies,
+            subtitles=body.subtitles,
+            title_card=body.title_card,
+        )
+    )
+
+
+@router.get("/repliz/jobs/{job_id}")
+async def get_repliz_job(job_id: str):
+    job = repliz.get_publish_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Tugas publikasi Repliz tidak ditemukan.")
+    return job
+
+
+@router.get("/repliz/{project_id}/records")
+async def list_repliz_records(project_id: str):
+    return {"records": repliz.list_records(project_id)}
+
+
+@router.delete("/repliz/{project_id}/records/{schedule_id}")
+async def cancel_repliz_record(project_id: str, schedule_id: str):
+    try:
+        return repliz.cancel_record(project_id, schedule_id)
+    except Exception as e:  # noqa: BLE001
+        raise _repliz_error(e)
+
+
+@router.post("/repliz/schedules/{schedule_id}/retry")
+async def retry_repliz_schedule(schedule_id: str):
+    try:
+        client = repliz.ReplizClient()
+        return client.retry_schedule(schedule_id)
+    except Exception as e:  # noqa: BLE001
+        raise _repliz_error(e)
+
+
+@router.delete("/repliz/schedules/{schedule_id}")
+async def delete_repliz_schedule(schedule_id: str):
+    try:
+        client = repliz.ReplizClient()
+        return client.delete_schedule(schedule_id)
+    except Exception as e:  # noqa: BLE001
+        raise _repliz_error(e)
+
+
+@router.get("/repliz/threads/search")
+async def search_repliz_threads(account_id: str, query: str, limit: int = 20):
+    try:
+        client = repliz.ReplizClient()
+        return client.search_threads_content(account_id=account_id, query=query, limit=limit)
+    except Exception as e:  # noqa: BLE001
+        raise _repliz_error(e)
+
+
+@router.get("/repliz/trends/tiktok")
+async def get_repliz_tiktok_trends(account_id: str, genre: str | None = None, country: str | None = None):
+    try:
+        client = repliz.ReplizClient()
+        return client.get_tiktok_trending_music(account_id=account_id, genre=genre, country=country)
+    except Exception as e:  # noqa: BLE001
+        raise _repliz_error(e)
+
