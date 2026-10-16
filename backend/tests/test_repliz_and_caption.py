@@ -12,7 +12,9 @@ from fastapi.testclient import TestClient
 
 from backend.api.v1.publish import router as publish_router
 from backend.services.caption_generator import (
+    CaptionGenerationResult,
     CaptionGenerator,
+    CaptionVariation,
     clean_product_links,
     clean_text,
     extract_hashtags_from_text,
@@ -118,18 +120,20 @@ def test_repliz_client_rpc(monkeypatch):
 
 
 def test_api_generate_caption_endpoint(client: TestClient):
-    sample_response = {
-        "topic": "Mindfulness",
-        "hashtags": ["#mindfulness", "#fokus", "#tenang", "#kesehatanmental"],
-        "variations": [
-            {
-                "style": "viral",
-                "style_label": "Viral & Catchy",
-                "caption": "Cara cepat bikin pikiran tenang dalam 5 menit! ✨ #mindfulness #fokus",
-            }
+    sample_result = CaptionGenerationResult(
+        title="5 Menit Menenangkan Pikiran",
+        topic="Mindfulness",
+        hashtags=["#mindfulness", "#fokus", "#tenang", "#kesehatanmental"],
+        variations=[
+            CaptionVariation(
+                style="viral",
+                style_label="Viral & Catchy",
+                caption="Cara cepat bikin pikiran tenang dalam 5 menit! ✨ #mindfulness #fokus",
+            )
         ],
-    }
-    with patch.object(CaptionGenerator, "_call_gemini_direct", return_value=sample_response):
+        best_caption="Cara cepat bikin pikiran tenang dalam 5 menit! ✨ #mindfulness #fokus",
+    )
+    with patch.object(CaptionGenerator, "generate", return_value=sample_result):
         resp = client.post(
             "/api/v1/publish/generate-caption",
             json={
@@ -156,15 +160,17 @@ def test_api_repliz_config_endpoint(client: TestClient):
     assert "access_key_masked" in data
 
 
-def test_api_repliz_accounts_endpoint(client: TestClient, monkeypatch):
-    with patch.object(
-        ReplizClient,
-        "list_accounts",
-        return_value=[{"_id": "acc_th", "name": "Gataloka", "type": "threads"}],
-    ):
-        resp = client.get("/api/v1/publish/repliz/accounts")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "accounts" in data
-        assert len(data["accounts"]) == 1
-        assert data["accounts"][0]["name"] == "Gataloka"
+def test_api_repliz_accounts_endpoint(client: TestClient):
+    mock_cfg = ReplizConfig(access_key="acc", secret_key="sec", configured=True, source="env")
+    with patch("backend.api.v1.publish.get_repliz_config", return_value=mock_cfg):
+        with patch.object(
+            ReplizClient,
+            "list_accounts",
+            return_value=[{"_id": "acc_th", "name": "Gataloka", "type": "threads"}],
+        ):
+            resp = client.get("/api/v1/publish/repliz/accounts")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert "accounts" in data
+            assert len(data["accounts"]) == 1
+            assert data["accounts"][0]["name"] == "Gataloka"
